@@ -7,7 +7,7 @@ import logging
 import secrets
 import time
 import datetime as dt
-from typing import List, Optional, Dict, Any, Tuple, Union
+from typing import List, Optional, Dict, Any, Tuple
 import xml.etree.ElementTree as ET
 
 import httpx
@@ -21,24 +21,27 @@ from cryptography.hazmat.primitives.ciphers import Cipher, algorithms, modes
 
 DEFAULT_API_BASE = "https://api-test.ksef.mf.gov.pl/v2"
 
+# --- timeouty logiczne (polling auth) ---
 AUTH_POLL_TIMEOUT_SEC = 40
 AUTH_POLL_INTERVAL_SEC = 1.0
 
+# --- timeouty HTTP ---
 HTTP_TIMEOUT = httpx.Timeout(60.0, connect=30.0)
 
+# --- polling status endpoint ---
 STATUS_POLL_INTERVAL_SEC = 2.0
-MAX_WAIT_SECONDS = 600
+MAX_WAIT_SECONDS = 600  # hard cap, zeby endpoint nie wisial wiecznie
 
-UPO_POLL_TIMEOUT_SEC = 15
-UPO_POLL_INTERVAL_SEC = 1.0
-
-app = FastAPI(title="KSeF FastAPI Gateway", version="1.5.2")
+app = FastAPI(title="KSeF Ultra Simple API", version="1.4.0")
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("ksef")
 
+# ------------------------------------------------
+# "ostatnia faktura" - stan w RAM (per NIP)
+# LAST_BY_NIP[nip] = {"so": "...", "ee": "...", "api_base": "...", "updated_at": "...ISO..."}
+# ------------------------------------------------
 LAST_BY_NIP: Dict[str, Dict[str, str]] = {}
-EE_INDEX: Dict[str, Dict[str, str]] = {}
 
 
 # ============================================================
@@ -84,11 +87,11 @@ def make_client(api_base: str) -> httpx.Client:
     return httpx.Client(
         base_url=api_base,
         timeout=HTTP_TIMEOUT,
-        headers={"User-Agent": f"ksef-fastapi-gateway/{app.version}"},
+        headers={"User-Agent": "ksef-fastapi-gateway/1.4.0"},
     )
 
 
-def http_json_or_raise(r: httpx.Response, where: str) -> Union[Dict[str, Any], List[Any]]:
+def http_json_or_raise(r: httpx.Response, where: str) -> Dict[str, Any]:
     if r.status_code >= 400:
         raise HTTPException(status_code=502, detail=f"{where} failed: {r.status_code} {r.text}")
     try:
@@ -152,11 +155,18 @@ def xml_find_text_any_ns(root: ET.Element, local_name: str) -> Optional[str]:
 
 
 def parse_upo_xml_to_json(upo_xml: bytes) -> Dict[str, Any]:
+    """
+    Minimalny parser UPO -> JSON.
+    UPO ma namespace, więc szukamy po local-name.
+    """
     try:
         root = ET.fromstring(upo_xml)
+
         out = {
             "root_tag": root.tag,
             "parsed": True,
+
+            # część pól może nie istnieć w UPO zależnie od wersji
             "ksef_reference": (
                 xml_find_text_any_ns(root, "NrKSeF")
                 or xml_find_text_any_ns(root, "NrKSeFDokumentu")
@@ -174,6 +184,7 @@ def parse_upo_xml_to_json(upo_xml: bytes) -> Dict[str, Any]:
                 or xml_find_text_any_ns(root, "AcceptanceDate")
             ),
         }
+
         return {k: v for k, v in out.items() if v not in (None, "", [])}
     except Exception as e:
         return {"parsed": False, "error": str(e)}
@@ -186,11 +197,14 @@ def parse_upo_xml_to_json(upo_xml: bytes) -> Dict[str, Any]:
 class SubmitResponse(BaseModel):
     so_reference: str
     ee_reference: str
+
     upo_reference: Optional[str] = None
     upo_xml_base64: Optional[str] = None
     upo_json: Optional[Dict[str, Any]] = None
+
     failed_invoices: Optional[dict] = None
     failed_invoice_for_ee: Optional[Dict[str, Any]] = None
+
     session_json: Optional[Dict[str, Any]] = None
     ee_status: Optional[Dict[str, Any]] = None
 
@@ -199,40 +213,11 @@ class LastStatusResponse(BaseModel):
     nip: str
     so_reference: str
     ee_reference: str
+
     ee_status: Dict[str, Any]
     session_json: Optional[Dict[str, Any]] = None
     failed_invoice_for_ee: Optional[Dict[str, Any]] = None
     failed_invoices: Optional[dict] = None
-
-
-class EeStatusResponse(BaseModel):
-    ee_reference: str
-    so_reference: str
-    nip: str
-    ee_status: Dict[str, Any]
-    session_json: Optional[Dict[str, Any]] = None
-    failed_invoice_for_ee: Optional[Dict[str, Any]] = None
-    failed_invoices: Optional[dict] = None
-
-
-class InvoicesListRequest(BaseModel):
-    ksef_token: str
-    api_base: str = DEFAULT_API_BASE
-    query: Dict[str, Any]
-    page_size: int = 50
-    page_offset: int = 0
-    include_xml: bool = False
-    max_xml: int = 10
-
-
-class InvoicesListResponse(BaseModel):
-    api_base: str
-    page_size: int
-    page_offset: int
-    items: List[Dict[str, Any]]
-    has_more: Optional[bool] = None
-    ksef_response: Dict[str, Any]
-    xml_by_ksef_number: Optional[Dict[str, str]] = None
 
 
 # ============================================================
@@ -248,9 +233,6 @@ def poll_auth_success(client: httpx.Client, auth_ref: str, auth_token: str) -> N
             headers={"Authorization": f"Bearer {auth_token}", "Accept": "application/json"},
         )
         last = http_json_or_raise(r, f"GET /auth/{auth_ref}")
-        if not isinstance(last, dict):
-            raise HTTPException(status_code=502, detail={"message": "Bad auth status payload type", "payload": last})
-
         code = (last.get("status") or {}).get("code")
         if code == 200:
             return
@@ -266,10 +248,7 @@ def get_failed_invoices(client: httpx.Client, access_token: str, so: str) -> dic
         f"/sessions/{so}/invoices/failed?pageSize=1000",
         headers={"Authorization": f"Bearer {access_token}", "Accept": "application/json"},
     )
-    j = http_json_or_raise(r, f"GET /sessions/{so}/invoices/failed")
-    if not isinstance(j, dict):
-        return {"raw": j}
-    return j
+    return http_json_or_raise(r, f"GET /sessions/{so}/invoices/failed")
 
 
 def get_session_json(client: httpx.Client, access_token: str, so: str) -> Dict[str, Any]:
@@ -277,34 +256,27 @@ def get_session_json(client: httpx.Client, access_token: str, so: str) -> Dict[s
         f"/sessions/{so}",
         headers={"Authorization": f"Bearer {access_token}", "Accept": "application/json"},
     )
-    j = http_json_or_raise(r, f"GET /sessions/{so}")
-    if not isinstance(j, dict):
-        raise HTTPException(status_code=502, detail={"message": "Bad session payload type", "payload": j})
-    return j
+    return http_json_or_raise(r, f"GET /sessions/{so}")
 
 
-def wait_for_upo_reference(
-    client: httpx.Client,
-    access_token: str,
-    so: str,
-    timeout_sec: int = UPO_POLL_TIMEOUT_SEC,
-    interval_sec: float = UPO_POLL_INTERVAL_SEC,
-) -> Tuple[str, Dict[str, Any]]:
+def wait_for_upo_reference(client: httpx.Client, access_token: str, so: str, timeout_sec: int = 180, interval_sec: float = 2.0) -> Tuple[str, Dict[str, Any]]:
     deadline = time.time() + timeout_sec
-    last: Optional[Dict[str, Any]] = None
+    last = None
 
     while time.time() < deadline:
         last = get_session_json(client, access_token, so)
 
+        # wariant: upo.pages[0].referenceNumber (to masz w odpowiedzi)
         pages = (last.get("upo") or {}).get("pages") or []
         if isinstance(pages, list) and pages and isinstance(pages[0], dict):
             upo_ref = pages[0].get("referenceNumber")
             if upo_ref:
-                return str(upo_ref), last
+                return upo_ref, last
 
+        # fallback: upoReference (gdyby API zwracało inaczej)
         upo_ref2 = last.get("upoReference")
         if upo_ref2:
-            return str(upo_ref2), last
+            return upo_ref2, last
 
         time.sleep(interval_sec)
 
@@ -321,43 +293,11 @@ def download_upo_xml(client: httpx.Client, access_token: str, so: str, upo_ref: 
     return r.content
 
 
-def query_invoices_metadata(
-    client: httpx.Client,
-    access_token: str,
-    query: Dict[str, Any],
-    page_size: int,
-    page_offset: int,
-) -> Dict[str, Any]:
-    payload = dict(query or {})
-    payload.setdefault("pageSize", page_size)
-    payload.setdefault("pageOffset", page_offset)
-
-    r = client.post(
-        "/invoices/query/metadata",
-        headers={"Authorization": f"Bearer {access_token}", "Accept": "application/json"},
-        json=payload,
-    )
-    j = http_json_or_raise(r, "POST /invoices/query/metadata")
-    if not isinstance(j, dict):
-        raise HTTPException(status_code=502, detail={"message": "Bad metadata payload type", "payload": j})
-    return j
-
-
-def download_invoice_by_ksef_number(
-    client: httpx.Client,
-    access_token: str,
-    ksef_number: str,
-) -> bytes:
-    r = client.get(
-        f"/invoices/ksef/{ksef_number}",
-        headers={"Authorization": f"Bearer {access_token}", "Accept": "application/octet-stream"},
-    )
-    if r.status_code >= 400:
-        raise HTTPException(status_code=502, detail=f"GET /invoices/ksef/{ksef_number} failed: {r.status_code} {r.text}")
-    return r.content
-
-
 def find_failed_invoice_by_ee(failed: Any, ee_reference: str) -> Optional[Dict[str, Any]]:
+    """
+    Z /sessions/{so}/invoices/failed -> SessionInvoicesResponse.invoices[].
+    Ten endpoint zwraca liste niepoprawnych faktur i ich statusy. :contentReference[oaicite:2]{index=2}
+    """
     invoices = None
     if isinstance(failed, dict):
         invoices = failed.get("invoices") or failed.get("items") or failed.get("entries") or failed.get("data")
@@ -374,24 +314,50 @@ def find_failed_invoice_by_ee(failed: Any, ee_reference: str) -> Optional[Dict[s
     return None
 
 
+def has_any_failed(failed: Any) -> bool:
+    if not isinstance(failed, dict):
+        return False
+    for k in ("invoices", "entries", "failedInvoices", "items", "data"):
+        v = failed.get(k)
+        if isinstance(v, list) and len(v) > 0:
+            return True
+    return False
+
+
 def build_ee_status_from_session_and_failed(
     ee_reference: str,
     session_json: Optional[Dict[str, Any]],
     failed_invoice: Optional[Dict[str, Any]],
 ) -> Dict[str, Any]:
+    """
+    SUCCESS:
+      - sesja status.code == 200 ("Sesja interaktywna przetworzona pomyślnie") :contentReference[oaicite:3]{index=3}
+      - i successfulInvoiceCount >= invoiceCount (lub >=1 przy braku invoiceCount)
+    FAILED:
+      - jeśli ee_reference jest na liście failed (zwraca statusy błędów) :contentReference[oaicite:4]{index=4}
+    PENDING:
+      - reszta
+    """
     if failed_invoice:
         st = failed_invoice.get("status") or {}
         code = st.get("code")
-        return {"state": "FAILED", "ee_reference": ee_reference, "ksef_status": st, "ksef_code": code}
+        return {
+            "state": "FAILED",
+            "ee_reference": ee_reference,
+            "ksef_status": st,
+            "ksef_code": code,
+        }
 
     if not isinstance(session_json, dict):
         return {"state": "PENDING", "ee_reference": ee_reference}
 
     st = session_json.get("status") or {}
     session_code = st.get("code")
+
     invoice_count = session_json.get("invoiceCount")
     ok_count = session_json.get("successfulInvoiceCount")
 
+    # defensywnie: jeśli są liczniki i sesja 200
     if session_code == 200:
         if isinstance(invoice_count, int) and isinstance(ok_count, int):
             if invoice_count > 0 and ok_count >= invoice_count:
@@ -402,6 +368,7 @@ def build_ee_status_from_session_and_failed(
                     "invoiceCount": invoice_count,
                     "successfulInvoiceCount": ok_count,
                 }
+        # fallback: jeśli nie ma liczników, ale jest UPO
         pages = (session_json.get("upo") or {}).get("pages") or []
         if isinstance(pages, list) and len(pages) > 0:
             return {"state": "SUCCESS", "ee_reference": ee_reference, "session_status": st}
@@ -414,141 +381,171 @@ def build_ee_status_from_session_and_failed(
 
 def authenticate_get_access_token(client: httpx.Client, ksef_token: str, nip: str) -> str:
     # 1) challenge
-    ch_any = http_json_or_raise(client.post("/auth/challenge", headers={"Accept": "application/json"}), "POST /auth/challenge")
-    if not isinstance(ch_any, dict):
-        raise HTTPException(status_code=502, detail={"message": "Bad /auth/challenge payload type", "payload": ch_any})
-
-    challenge = ch_any.get("challenge")
-    ts_ms = to_unix_ms(ch_any.get("timestamp"))
+    ch = http_json_or_raise(
+        client.post("/auth/challenge", headers={"Accept": "application/json"}),
+        "POST /auth/challenge",
+    )
+    challenge = ch.get("challenge")
+    ts_ms = to_unix_ms(ch.get("timestamp"))
     if not challenge:
-        raise HTTPException(status_code=502, detail={"message": "No challenge in /auth/challenge", "resp": ch_any})
+        raise HTTPException(502, "No challenge in /auth/challenge")
 
-    # 2) certs (moze byc listą)
-    certs_any = http_json_or_raise(client.get("/security/public-key-certificates", headers={"Accept": "application/json"}), "GET /security/public-key-certificates")
-    if isinstance(certs_any, list):
-        cert_list = certs_any
-    elif isinstance(certs_any, dict):
-        cert_list = certs_any.get("certificates") or certs_any.get("items") or certs_any.get("data") or []
-    else:
-        cert_list = []
+    # 2) certs
+    certs = http_json_or_raise(
+        client.get("/security/public-key-certificates", headers={"Accept": "application/json"}),
+        "GET /security/public-key-certificates",
+    )
+    cert_token = pick_cert(certs, "KsefTokenEncryption")
 
-    if not isinstance(cert_list, list) or not cert_list:
-        raise HTTPException(status_code=502, detail={"message": "No certificates returned", "resp": certs_any})
+    # 3) encrypt token|timestamp
+    encrypted_token = b64e(
+        rsa_encrypt(cert_token["certificate"], f"{ksef_token}|{ts_ms}".encode("utf-8"))
+    )
 
-    try:
-        cert = pick_cert([c for c in cert_list if isinstance(c, dict)], "encryption")
-    except Exception:
-        cert = cert_list[0] if isinstance(cert_list[0], dict) else None
+    # 4) auth/ksef-token
+    auth_resp = http_json_or_raise(
+        client.post(
+            "/auth/ksef-token",
+            headers={"Accept": "application/json", "Content-Type": "application/json"},
+            json={
+                "challenge": challenge,
+                "contextIdentifier": {"type": "Nip", "value": nip},
+                "encryptedToken": encrypted_token,
+            },
+        ),
+        "POST /auth/ksef-token",
+    )
 
-    if not isinstance(cert, dict):
-        raise HTTPException(status_code=502, detail={"message": "Bad certificate entry type", "entry": cert})
-
-    cert_b64 = cert.get("certificate") or cert.get("certificateDer") or cert.get("cert")
-    if not cert_b64:
-        raise HTTPException(status_code=502, detail={"message": "No certificate DER in response", "resp": certs_any})
-
-    # 3) RSA OAEP: token|timestamp
-    plaintext = f"{ksef_token}|{ts_ms}".encode("utf-8")
-    encrypted = rsa_encrypt(cert_b64, plaintext)
-
-    # 4) POST /auth/ksef-token  <-- TU BYL BLAD: MUSI BYC contextIdentifier
-    body = {
-        "challenge": challenge,
-        "contextIdentifier": {"type": "Nip", "value": nip},
-        "encryptedToken": b64e(encrypted),
-    }
-    r = client.post("/auth/ksef-token", json=body, headers={"Accept": "application/json"})
-    auth_resp_any = http_json_or_raise(r, "POST /auth/ksef-token")
-    if not isinstance(auth_resp_any, dict):
-        raise HTTPException(status_code=502, detail={"message": "Bad /auth/ksef-token payload type", "payload": auth_resp_any})
-
-    auth_ref = auth_resp_any.get("referenceNumber") or (auth_resp_any.get("authenticationToken") or {}).get("referenceNumber")
-    auth_token = (auth_resp_any.get("authenticationToken") or {}).get("token")
-
+    auth_ref = auth_resp.get("referenceNumber")
+    auth_token = ((auth_resp.get("authenticationToken") or {}).get("token"))
     if not auth_ref or not auth_token:
-        raise HTTPException(status_code=502, detail={"message": "Bad /auth/ksef-token response", "resp": auth_resp_any})
+        raise HTTPException(502, detail={"message": "Bad /auth/ksef-token response", "raw": auth_resp})
 
-    # 5) poll /auth/{ref}
-    poll_auth_success(client, str(auth_ref), str(auth_token))
+    poll_auth_success(client, auth_ref, auth_token)
 
-    # 6) redeem
-    rr = client.post("/auth/token/redeem", headers={"Authorization": f"Bearer {auth_token}", "Accept": "application/json"})
-    redeem_any = http_json_or_raise(rr, "POST /auth/token/redeem")
-    if not isinstance(redeem_any, dict):
-        raise HTTPException(status_code=502, detail={"message": "Bad redeem payload type", "payload": redeem_any})
+    redeem = http_json_or_raise(
+        client.post(
+            "/auth/token/redeem",
+            headers={"Authorization": f"Bearer {auth_token}", "Accept": "application/json"},
+            json={},
+        ),
+        "POST /auth/token/redeem",
+    )
 
-    access_token = (redeem_any.get("accessToken") or {}).get("token") or redeem_any.get("token")
+    access_token = ((redeem.get("accessToken") or {}).get("token"))
     if not access_token:
-        raise HTTPException(status_code=502, detail={"message": "No accessToken in redeem", "resp": redeem_any})
-    return str(access_token)
+        raise HTTPException(502, detail={"message": "No accessToken in redeem", "raw": redeem})
+
+    return access_token
 
 
 # ============================================================
-# ENDPOINT: submit invoice
+# ENDPOINT: submit
 # ============================================================
 
 @app.post("/invoice/submit", response_model=SubmitResponse)
-def submit_invoice(
-    ksef_token: str = Form(...),
-    file: UploadFile = File(...),
-    api_base: Optional[str] = Form(None),
+async def submit_invoice(
+    ksef_token: str = Form(..., description="Token EC z KSeF"),
+    file: UploadFile = File(..., description="Plik XML faktury (UTF-8)"),
+    api_base: str = Form(DEFAULT_API_BASE),
 ):
-    api_base = api_base or DEFAULT_API_BASE
+    raw = await file.read()
+    if not raw:
+        raise HTTPException(400, "Empty XML file")
+
+    try:
+        xml_text = raw.decode("utf-8")
+    except UnicodeDecodeError:
+        raise HTTPException(400, "XML must be UTF-8")
+
+    invoice_bytes = normalize_xml(xml_text)
     nip = extract_nip_from_ksef_token(ksef_token)
 
-    xml_text = file.file.read().decode("utf-8", errors="strict")
-    xml_bytes = normalize_xml(xml_text)
-
     with make_client(api_base) as client:
+        # auth -> access token
         access_token = authenticate_get_access_token(client, ksef_token, nip)
 
-        r = client.post("/sessions/online", headers={"Authorization": f"Bearer {access_token}", "Accept": "application/json"}, json={})
-        so_open_any = http_json_or_raise(r, "POST /sessions/online")
-        if not isinstance(so_open_any, dict):
-            raise HTTPException(status_code=502, detail={"message": "Bad /sessions/online payload type", "payload": so_open_any})
-        so = so_open_any.get("referenceNumber")
-        if not so:
-            raise HTTPException(status_code=502, detail={"message": "No so_reference in /sessions/online", "resp": so_open_any})
+        # cert symmetric
+        certs = http_json_or_raise(
+            client.get("/security/public-key-certificates", headers={"Accept": "application/json"}),
+            "GET /security/public-key-certificates",
+        )
+        cert_sym = pick_cert(certs, "SymmetricKeyEncryption")
 
+        # open session
         aes_key = secrets.token_bytes(32)
-        aes_iv = secrets.token_bytes(16)
-        encrypted_invoice = aes_encrypt(xml_bytes, aes_key, aes_iv)
+        iv = secrets.token_bytes(16)
+        encrypted_key = b64e(rsa_encrypt(cert_sym["certificate"], aes_key))
 
-        inv_body = {
-            "invoiceHash": {"hashSHA": sha256_b64(xml_bytes)},
-            "invoicePayload": {
-                "type": "xml",
-                "encryptedInvoice": b64e(encrypted_invoice),
-                "encryption": {"type": "AES", "mode": "CBC", "key": b64e(aes_key), "iv": b64e(aes_iv)},
-            },
-        }
-        r = client.post(f"/sessions/online/{so}/invoices", headers={"Authorization": f"Bearer {access_token}", "Accept": "application/json"}, json=inv_body)
-        inv_send_any = http_json_or_raise(r, f"POST /sessions/online/{so}/invoices")
-        if not isinstance(inv_send_any, dict):
-            raise HTTPException(status_code=502, detail={"message": "Bad invoices payload type", "payload": inv_send_any})
-        ee = inv_send_any.get("referenceNumber")
+        open_resp = http_json_or_raise(
+            client.post(
+                "/sessions/online",
+                headers={
+                    "Authorization": f"Bearer {access_token}",
+                    "Accept": "application/json",
+                    "Content-Type": "application/json",
+                },
+                json={
+                    "formCode": {"systemCode": "FA (3)", "schemaVersion": "1-0E", "value": "FA"},
+                    "encryption": {
+                        "encryptedSymmetricKey": encrypted_key,
+                        "initializationVector": b64e(iv),
+                    },
+                },
+            ),
+            "POST /sessions/online",
+        )
+        so = open_resp.get("referenceNumber")
+        if not so:
+            raise HTTPException(502, detail={"message": "No SO reference", "raw": open_resp})
+
+        # encrypt + send invoice
+        enc_invoice = aes_encrypt(invoice_bytes, aes_key, iv)
+
+        send_resp = http_json_or_raise(
+            client.post(
+                f"/sessions/online/{so}/invoices",
+                headers={
+                    "Authorization": f"Bearer {access_token}",
+                    "Accept": "application/json",
+                    "Content-Type": "application/json",
+                },
+                json={
+                    "invoiceHash": sha256_b64(invoice_bytes),
+                    "invoiceSize": len(invoice_bytes),
+                    "encryptedInvoiceHash": sha256_b64(enc_invoice),
+                    "encryptedInvoiceSize": len(enc_invoice),
+                    "encryptedInvoiceContent": b64e(enc_invoice),
+                    "offlineMode": False,
+                },
+            ),
+            f"POST /sessions/online/{so}/invoices",
+        )
+        ee = send_resp.get("referenceNumber")
         if not ee:
-            raise HTTPException(status_code=502, detail={"message": "No ee_reference in invoices response", "resp": inv_send_any})
+            raise HTTPException(502, detail={"message": "No EE reference", "raw": send_resp})
 
-        r = client.post(f"/sessions/online/{so}/close", headers={"Authorization": f"Bearer {access_token}", "Accept": "application/json"}, json={})
-        _ = http_json_or_raise(r, f"POST /sessions/online/{so}/close")
+        # close
+        r_close = client.post(
+            f"/sessions/online/{so}/close",
+            headers={"Authorization": f"Bearer {access_token}", "Accept": "application/json"},
+        )
+        if r_close.status_code >= 400:
+            raise HTTPException(status_code=502, detail=f"Close failed: {r_close.status_code} {r_close.text}")
 
-        failed = get_failed_invoices(client, access_token, str(so))
-        failed_invoice_for_ee = find_failed_invoice_by_ee(failed, str(ee))
+        # failed early check
+        failed = get_failed_invoices(client, access_token, so)
+        failed_invoice_for_ee = find_failed_invoice_by_ee(failed, ee)
 
-        now_iso = dt.datetime.utcnow().replace(tzinfo=dt.timezone.utc).isoformat()
-        LAST_BY_NIP[nip] = {"so": str(so), "ee": str(ee), "api_base": api_base, "updated_at": now_iso}
-        EE_INDEX[str(ee)] = {"so": str(so), "nip": nip, "api_base": api_base, "updated_at": now_iso}
-
-        if failed_invoice_for_ee:
-            session_json = get_session_json(client, access_token, str(so))
-            ee_status = build_ee_status_from_session_and_failed(str(ee), session_json, failed_invoice_for_ee)
+        if has_any_failed(failed):
+            session_json = get_session_json(client, access_token, so)
+            ee_status = build_ee_status_from_session_and_failed(ee, session_json, failed_invoice_for_ee)
             raise HTTPException(
                 status_code=422,
                 detail={
                     "message": "KSeF reported failed invoice(s) for this session - no UPO will be produced",
-                    "so_reference": str(so),
-                    "ee_reference": str(ee),
+                    "so_reference": so,
+                    "ee_reference": ee,
                     "failed_invoices": failed,
                     "failed_invoice_for_ee": failed_invoice_for_ee,
                     "session_json": session_json,
@@ -556,46 +553,27 @@ def submit_invoice(
                 },
             )
 
-        try:
-            upo_ref, session_json = wait_for_upo_reference(client, access_token, str(so), timeout_sec=UPO_POLL_TIMEOUT_SEC, interval_sec=UPO_POLL_INTERVAL_SEC)
-        except HTTPException as e:
-            if e.status_code == 504:
-                session_json2 = None
-                failed2 = None
-                failed_invoice_for_ee2 = None
-                try:
-                    session_json2 = get_session_json(client, access_token, str(so))
-                except Exception:
-                    pass
-                try:
-                    failed2 = get_failed_invoices(client, access_token, str(so))
-                    failed_invoice_for_ee2 = find_failed_invoice_by_ee(failed2, str(ee))
-                except Exception:
-                    pass
+        # wait UPO (default)
+        upo_ref, session_json = wait_for_upo_reference(client, access_token, so, timeout_sec=180, interval_sec=2.0)
 
-                ee_status2 = build_ee_status_from_session_and_failed(str(ee), session_json2, failed_invoice_for_ee2)
-                raise HTTPException(
-                    status_code=504,
-                    detail={
-                        "message": f"UPO not available within {UPO_POLL_TIMEOUT_SEC}s",
-                        "so_reference": str(so),
-                        "ee_reference": str(ee),
-                        "session_json": session_json2,
-                        "failed_invoices": failed2,
-                        "failed_invoice_for_ee": failed_invoice_for_ee2,
-                        "ee_status": ee_status2,
-                    },
-                )
-            raise
-
-        upo_xml = download_upo_xml(client, access_token, str(so), str(upo_ref))
+        upo_xml = download_upo_xml(client, access_token, so, upo_ref)
         upo_json = parse_upo_xml_to_json(upo_xml)
-        ee_status = build_ee_status_from_session_and_failed(str(ee), session_json, failed_invoice_for_ee)
+
+        # ee_status based on session + failed
+        ee_status = build_ee_status_from_session_and_failed(ee, session_json, failed_invoice_for_ee)
+
+        # zapisz "ostatnia faktura" per NIP
+        LAST_BY_NIP[nip] = {
+            "so": so,
+            "ee": ee,
+            "api_base": api_base,
+            "updated_at": dt.datetime.utcnow().replace(tzinfo=dt.timezone.utc).isoformat(),
+        }
 
         return SubmitResponse(
-            so_reference=str(so),
-            ee_reference=str(ee),
-            upo_reference=str(upo_ref),
+            so_reference=so,
+            ee_reference=ee,
+            upo_reference=upo_ref,
             upo_xml_base64=b64e(upo_xml),
             upo_json=upo_json,
             failed_invoices=failed,
@@ -605,141 +583,77 @@ def submit_invoice(
         )
 
 
+# ============================================================
+# ENDPOINT: last status (polling)
+# ============================================================
+
 @app.post("/invoice/last/status", response_model=LastStatusResponse)
-def last_status(ksef_token: str = Form(...), wait_seconds: int = Form(0), api_base: Optional[str] = Form(None)):
-    api_base = api_base or DEFAULT_API_BASE
+def last_invoice_status(
+    ksef_token: str = Form(..., description="Token EC z KSeF"),
+    wait_seconds: int = Form(0, description="Ile sekund maksymalnie czekac na SUCCESS/FAILED (0 = bez czekania)"),
+    api_base: str = Form(DEFAULT_API_BASE),
+):
     nip = extract_nip_from_ksef_token(ksef_token)
 
     last = LAST_BY_NIP.get(nip)
     if not last:
-        raise HTTPException(status_code=404, detail={"message": "No last invoice for this NIP (RAM is empty)", "nip": nip})
+        raise HTTPException(404, detail=f"No last invoice stored for NIP={nip}. Call /invoice/submit first.")
 
     so = last["so"]
     ee = last["ee"]
-    api_base = last.get("api_base") or api_base
 
-    wait_seconds = max(0, min(int(wait_seconds or 0), MAX_WAIT_SECONDS))
+    # wait cap
+    if wait_seconds is None:
+        wait_seconds = 0
+    try:
+        wait_seconds = int(wait_seconds)
+    except Exception:
+        raise HTTPException(400, detail="wait_seconds must be int")
+
+    if wait_seconds < 0:
+        wait_seconds = 0
+    if wait_seconds > MAX_WAIT_SECONDS:
+        wait_seconds = MAX_WAIT_SECONDS
 
     with make_client(api_base) as client:
         access_token = authenticate_get_access_token(client, ksef_token, nip)
 
         deadline = time.time() + wait_seconds
-        session_json = None
-        failed = None
-        failed_invoice_for_ee = None
-        ee_status = {"state": "PENDING", "ee_reference": ee}
+        last_session_json: Optional[Dict[str, Any]] = None
+        last_failed: Optional[dict] = None
+        last_failed_for_ee: Optional[Dict[str, Any]] = None
+        last_status: Dict[str, Any] = {"state": "PENDING", "ee_reference": ee}
 
         while True:
-            session_json = get_session_json(client, access_token, so)
-            failed = get_failed_invoices(client, access_token, so)
-            failed_invoice_for_ee = find_failed_invoice_by_ee(failed, ee)
-            ee_status = build_ee_status_from_session_and_failed(ee, session_json, failed_invoice_for_ee)
+            # 1) sesja
+            last_session_json = get_session_json(client, access_token, so)
 
-            if ee_status.get("state") in ("SUCCESS", "FAILED"):
+            # 2) failed (jesli ee jest na liscie -> FAILED)
+            last_failed = get_failed_invoices(client, access_token, so)
+            last_failed_for_ee = find_failed_invoice_by_ee(last_failed, ee)
+
+            # 3) ee_status
+            last_status = build_ee_status_from_session_and_failed(ee, last_session_json, last_failed_for_ee)
+
+            if last_status.get("state") in ("SUCCESS", "FAILED"):
                 break
+
             if time.time() >= deadline:
                 break
+
             time.sleep(STATUS_POLL_INTERVAL_SEC)
 
         return LastStatusResponse(
             nip=nip,
             so_reference=so,
             ee_reference=ee,
-            ee_status=ee_status,
-            session_json=session_json,
-            failed_invoice_for_ee=failed_invoice_for_ee,
-            failed_invoices=failed,
-        )
-
-
-@app.get("/status/{ee_reference}", response_model=EeStatusResponse)
-def status_by_ee_reference(ee_reference: str, ksef_token: str, wait_seconds: int = 0, api_base: Optional[str] = None):
-    wait_seconds = max(0, min(int(wait_seconds or 0), MAX_WAIT_SECONDS))
-
-    idx = EE_INDEX.get(ee_reference)
-    if not idx:
-        raise HTTPException(status_code=404, detail={"message": "Unknown ee_reference (not in gateway RAM index)", "ee_reference": ee_reference})
-
-    nip = idx["nip"]
-    so = idx["so"]
-    api_base = api_base or idx.get("api_base") or DEFAULT_API_BASE
-
-    with make_client(api_base) as client:
-        access_token = authenticate_get_access_token(client, ksef_token, nip)
-
-        deadline = time.time() + wait_seconds
-        session_json = None
-        failed = None
-        failed_invoice_for_ee = None
-        ee_status = {"state": "PENDING", "ee_reference": ee_reference}
-
-        while True:
-            session_json = get_session_json(client, access_token, so)
-            failed = get_failed_invoices(client, access_token, so)
-            failed_invoice_for_ee = find_failed_invoice_by_ee(failed, ee_reference)
-            ee_status = build_ee_status_from_session_and_failed(ee_reference, session_json, failed_invoice_for_ee)
-
-            if ee_status.get("state") in ("SUCCESS", "FAILED"):
-                break
-            if time.time() >= deadline:
-                break
-            time.sleep(STATUS_POLL_INTERVAL_SEC)
-
-        return EeStatusResponse(
-            ee_reference=ee_reference,
-            so_reference=so,
-            nip=nip,
-            ee_status=ee_status,
-            session_json=session_json,
-            failed_invoice_for_ee=failed_invoice_for_ee,
-            failed_invoices=failed,
-        )
-
-
-@app.post("/invoices/list", response_model=InvoicesListResponse)
-def invoices_list(req: InvoicesListRequest):
-    nip = extract_nip_from_ksef_token(req.ksef_token)
-    api_base = req.api_base or DEFAULT_API_BASE
-
-    page_size = max(1, min(int(req.page_size or 50), 1000))
-    page_offset = max(0, int(req.page_offset or 0))
-
-    include_xml = bool(req.include_xml)
-    max_xml = max(0, min(int(req.max_xml or 0), 50))
-
-    with make_client(api_base) as client:
-        access_token = authenticate_get_access_token(client, req.ksef_token, nip)
-
-        ksef_resp = query_invoices_metadata(client, access_token, req.query, page_size, page_offset)
-        items = (ksef_resp.get("invoices") or ksef_resp.get("items") or ksef_resp.get("entries") or ksef_resp.get("data") or [])
-        if not isinstance(items, list):
-            items = []
-
-        has_more = ksef_resp.get("hasMore")
-        xml_by = None
-
-        if include_xml and max_xml > 0:
-            xml_by = {}
-            for inv in items[:max_xml]:
-                if not isinstance(inv, dict):
-                    continue
-                ksef_number = inv.get("ksefNumber") or inv.get("nrKSeF") or inv.get("NrKSeF") or inv.get("NrKSeFDokumentu")
-                if not ksef_number:
-                    continue
-                xml_bytes = download_invoice_by_ksef_number(client, access_token, str(ksef_number))
-                xml_by[str(ksef_number)] = b64e(xml_bytes)
-
-        return InvoicesListResponse(
-            api_base=api_base,
-            page_size=page_size,
-            page_offset=page_offset,
-            items=items,
-            has_more=has_more if isinstance(has_more, bool) else None,
-            ksef_response=ksef_resp,
-            xml_by_ksef_number=xml_by,
+            ee_status=last_status,
+            session_json=last_session_json,
+            failed_invoice_for_ee=last_failed_for_ee,
+            failed_invoices=last_failed,
         )
 
 
 @app.get("/health")
 def health():
-    return {"ok": True, "version": app.version}
+    return {"ok": True}
